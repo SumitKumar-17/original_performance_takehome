@@ -198,8 +198,8 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", nv, tmp))
             preloaded.append(nv)
 
-        # Process 4 chunks in parallel to maximize VLIW utilization
-        N_PARALLEL = min(4, batch_size // VLEN)
+        # Process 8 chunks in parallel to maximize VLIW utilization
+        N_PARALLEL = min(8, batch_size // VLEN)
 
         # Allocate minimal register set per chunk
         chunks = []
