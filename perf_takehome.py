@@ -187,19 +187,8 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # Simplified LINEAR INTERPOLATION: Preload first 4 nodes
-        # These are hit most frequently in early rounds
-        # Total: 4 nodes = 32 words (minimal overhead)
-        preloaded = []
-        for node_idx in range(min(4, n_nodes)):
-            nv = self.alloc_scratch(f"n{node_idx}", VLEN)
-            self.add("alu", ("+", tmp, self.scratch["forest_values_p"], self.scratch_const(node_idx)))
-            self.add("load", ("load", tmp, tmp))
-            self.add("valu", ("vbroadcast", nv, tmp))
-            preloaded.append(nv)
-
-        # Process 8 chunks in parallel to maximize VLIW utilization
-        N_PARALLEL = min(8, batch_size // VLEN)
+        # Process 6 chunks in parallel (sweet spot for slot limits)
+        N_PARALLEL = min(6, batch_size // VLEN)
 
         # Allocate minimal register set per chunk
         chunks = []
@@ -228,14 +217,11 @@ class KernelBuilder:
         one_v = self.alloc_scratch("one_v", VLEN)
         zero_v = self.alloc_scratch("zero_v", VLEN)
         n_nodes_v = self.alloc_scratch("n_nodes_v", VLEN)
-        four_v = self.alloc_scratch("four_v", VLEN) if len(preloaded) == 4 else None
 
         self.add("valu", ("vbroadcast", two_v, two_const))
         self.add("valu", ("vbroadcast", one_v, one_const))
         self.add("valu", ("vbroadcast", zero_v, zero_const))
         self.add("valu", ("vbroadcast", n_nodes_v, self.scratch["n_nodes"]))
-        if four_v:
-            self.add("valu", ("vbroadcast", four_v, self.scratch_const(4)))
 
         num_vec_chunks = batch_size // VLEN
 
