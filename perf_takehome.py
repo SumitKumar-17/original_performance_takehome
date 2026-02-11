@@ -203,14 +203,26 @@ class KernelBuilder:
 
         addrs = [self.alloc_scratch(f"a{i}") for i in range(40)]
 
-        # Hash constants
+        # Hash constants - optimize with multiply_add fusion where possible
         hash_consts = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            v1 = self.alloc_scratch(f"hc1_{hi}", VLEN)
-            v3 = self.alloc_scratch(f"hc3_{hi}", VLEN)
-            self.add("valu", ("vbroadcast", v1, self.scratch_const(val1)))
-            self.add("valu", ("vbroadcast", v3, self.scratch_const(val3)))
-            hash_consts.append((v1, v3, op1, op2, op3))
+            # Check if this stage can be optimized to multiply_add
+            # Pattern: (val + const) + (val << shift) = multiply_add(val, 1 + 2^shift, const)
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # This stage can use multiply_add!
+                multiplier = 1 + (1 << val3)
+                v_mult = self.alloc_scratch(f"hc_mult_{hi}", VLEN)
+                v_add = self.alloc_scratch(f"hc_add_{hi}", VLEN)
+                self.add("valu", ("vbroadcast", v_mult, self.scratch_const(multiplier)))
+                self.add("valu", ("vbroadcast", v_add, self.scratch_const(val1)))
+                hash_consts.append(("multiply_add", v_mult, v_add))
+            else:
+                # Standard 3-operation hash stage
+                v1 = self.alloc_scratch(f"hc1_{hi}", VLEN)
+                v3 = self.alloc_scratch(f"hc3_{hi}", VLEN)
+                self.add("valu", ("vbroadcast", v1, self.scratch_const(val1)))
+                self.add("valu", ("vbroadcast", v3, self.scratch_const(val3)))
+                hash_consts.append((v1, v3, op1, op2, op3))
 
         # Constant vectors
         two_v = self.alloc_scratch("two_v", VLEN)
@@ -280,22 +292,31 @@ class KernelBuilder:
                           for p in range(n_active)]
                 self.instrs.append({"valu": xor_ops})
 
-                # PHASE 4: Hash with maximum parallelism
-                for hi, (v1, v3, op1, op2, op3) in enumerate(hash_consts):
-                    # First cycle: 2 ops per chunk (up to 6 VALU slots with 3 chunks)
-                    valu_ops = []
-                    for p in range(n_active):
-                        c = chunks[p]
-                        valu_ops.append((op1, c['t1'], c['val'], v1))
-                        valu_ops.append((op3, c['t2'], c['val'], v3))
-                    # Pack into cycles (max 6 VALU slots)
-                    for i in range(0, len(valu_ops), 6):
-                        self.instrs.append({"valu": valu_ops[i:min(i+6, len(valu_ops))]})
+                # PHASE 4: Hash with multiply_add fusion optimization
+                for hi, stage_info in enumerate(hash_consts):
+                    if stage_info[0] == "multiply_add":
+                        # Optimized path: single multiply_add instruction
+                        v_mult, v_add = stage_info[1], stage_info[2]
+                        valu_ops = [("multiply_add", chunks[p]['val'], chunks[p]['val'], v_mult, v_add)
+                                   for p in range(n_active)]
+                        self.instrs.append({"valu": valu_ops})
+                    else:
+                        # Standard 3-operation hash stage
+                        v1, v3, op1, op2, op3 = stage_info
+                        # First cycle: 2 ops per chunk (up to 6 VALU slots)
+                        valu_ops = []
+                        for p in range(n_active):
+                            c = chunks[p]
+                            valu_ops.append((op1, c['t1'], c['val'], v1))
+                            valu_ops.append((op3, c['t2'], c['val'], v3))
+                        # Pack into cycles (max 6 VALU slots)
+                        for i in range(0, len(valu_ops), 6):
+                            self.instrs.append({"valu": valu_ops[i:min(i+6, len(valu_ops))]})
 
-                    # Second cycle: combine results
-                    valu_ops = [(op2, chunks[p]['val'], chunks[p]['t1'], chunks[p]['t2'])
-                               for p in range(n_active)]
-                    self.instrs.append({"valu": valu_ops})
+                        # Second cycle: combine results
+                        valu_ops = [(op2, chunks[p]['val'], chunks[p]['t1'], chunks[p]['t2'])
+                                   for p in range(n_active)]
+                        self.instrs.append({"valu": valu_ops})
 
                     for p in range(n_active):
                         for vi in range(VLEN):
